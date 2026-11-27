@@ -31,7 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import backup, crypto, media, sso, targets
+from . import backup, crypto, media, similar, sso, targets
 from .forms import Form as UploadForm, FormError, UploadPart, parse_form
 from .spool import Spool, SpoolFull
 from .store import fsync_dir, fsync_tree, write_durable, Store, seal, unseal
@@ -1172,6 +1172,26 @@ def _get_study(sid: str, master: bytes) -> dict:
 @app.get("/api/studies/{sid}")
 def get_study(sid: str, request: Request):
     return _get_study(sid, data_access(request))
+
+
+@app.get("/api/studies/{sid}/similar")
+def similar_studies(sid: str, request: Request):
+    """The patient's other studies, most comparable first (same type, body part and wording, closest in time)."""
+    master = data_access(request)
+    base = _get_study(sid, master)
+    c = store.conn()
+    rows = c.execute("SELECT * FROM studies WHERE patient_id=? AND id<>?", (base["patient_id"], sid)).fetchall()
+    files: dict = {}
+    for f in c.execute("SELECT id, study_id, kind, has_preview FROM files WHERE patient_id=? ORDER BY created_at", (base["patient_id"],)):
+        files.setdefault(f["study_id"], []).append(f)
+    others = []
+    for r in rows:
+        fl = files.get(r["id"], [])
+        s = _study_out(r, master, len(fl))
+        s["thumbnail_ids"] = [f["id"] for f in fl if f["has_preview"]][:3]
+        s["image_count"] = sum(1 for f in fl if f["kind"] != "report")
+        others.append(s)
+    return similar.rank(base, others)
 
 
 @app.put("/api/studies/{sid}")

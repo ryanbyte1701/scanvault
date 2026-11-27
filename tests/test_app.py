@@ -272,3 +272,25 @@ def test_recent_studies_for_home(client, setup):
     # still routes to a single study by id
     assert client.get(f"/api/studies/{old['id']}", headers=B).json()["title"] == "Older study"
     assert client.get("/api/studies/recent").status_code in (401, 403)
+
+
+def test_similar_endpoint(client, setup):
+    B = {"Authorization": f"Bearer {setup['token']}"}
+    p = client.post("/api/patients", json={"name": "Compare Person"}, headers=B).json()
+    other = client.post("/api/patients", json={"name": "Someone Else"}, headers=B).json()
+    mk = lambda pid, **j: client.post(f"/api/patients/{pid}/studies", json=j, headers=B).json()
+    cur = mk(p["id"], title="MRI left knee", modality="MR", body_part="KNEE", study_date="2026-03-14")
+    prior = mk(p["id"], title="MRI left knee", modality="MR", body_part="KNEE", study_date="2024-03-01")
+    chest = mk(p["id"], title="Chest X-ray", modality="DX", study_date="2026-03-01")
+    mk(other["id"], title="MRI left knee", modality="MR", body_part="KNEE")
+    client.post(f"/api/studies/{prior['id']}/files", files=[("file", ("film.png", png_bytes(), "image/png"))], headers=B)
+    r = client.get(f"/api/studies/{cur['id']}/similar", headers=B)
+    assert r.status_code == 200, r.text
+    rows = r.json()
+    assert [s["id"] for s in rows] == [prior["id"], chest["id"]]  # never itself, never another patient
+    top = rows[0]
+    assert top["suggested"] and top["relation"] == "prior" and top["image_count"] == 1 and len(top["thumbnail_ids"]) == 1
+    assert "Same type (MRI)" in top["match_reasons"]
+    assert not rows[1]["suggested"]
+    assert client.get("/api/studies/nope/similar", headers=B).status_code == 404
+    assert client.get(f"/api/studies/{cur['id']}/similar").status_code in (401, 403)

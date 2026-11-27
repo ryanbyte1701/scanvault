@@ -752,13 +752,14 @@ async function viewStudy(id) {
   m.innerHTML = `${mobileHead()}<div class="crumbs"><a href="#/patients" data-go="patients">Patients</a><span>/</span><a href="#/patient/${esc(p.id)}" data-go="patient/${esc(p.id)}">${esc(p.name)}</a><span>/</span><span>${esc(s.title)}</span></div>
   <div class="top"><div><h1>${esc(s.title)}</h1><p class="sub">${[s.study_date && fmtDate(s.study_date), s.modality, s.facility, s.referring_physician && "Ref. " + s.referring_physician, s.accession && "Acc. " + s.accession].filter(Boolean).map(esc).join(" · ")}</p>
     ${s.description ? `<p class="small" style="margin-top:8px;max-width:70ch">${esc(s.description)}</p>` : ""}</div>
-    <div class="row"><button class="btn" id="edit">Edit</button><label tabindex="0" role="button" class="btn primary">${I.upload} Add files<input type="file" id="fi" multiple hidden></label></div></div>
+    <div class="row"><button class="btn" id="edit">Edit</button>${imgs.length ? `<button class="btn" id="cmp" title="Show next to another study of this patient">Compare</button>` : ""}<label tabindex="0" role="button" class="btn primary">${I.upload} Add files<input type="file" id="fi" multiple hidden></label></div></div>
   <div class="drop" id="drop" style="padding:16px">${I.upload}<div class="small"><b>Drop more files for this study</b></div></div>
   <div class="queue" id="queue"></div>
   ${reports.length ? `<div class="section-h"><h2>Reports</h2></div><div class="lightbox">${reports.map(tile).join("")}</div>` : ""}
   <div class="section-h"><h2>Images</h2><span class="muted small">${imgs.length} file${imgs.length === 1 ? "" : "s"}</span></div>
   ${imgs.length ? `<div class="lightbox">${imgs.map(tile).join("")}</div>` : `<div class="card empty">${I.scan}<p>No images in this study yet.</p></div>`}`;
   $("#edit").onclick = () => studyForm(p.id, s);
+  if ($("#cmp")) $("#cmp").onclick = () => pickCompare(id).catch(handleErr);
   const up = fl => uploadFiles(`/api/studies/${id}/files?format=full`, fl, () => viewStudy(id));
   wireDrop($("#drop"), up);
   $("#fi").onchange = e => up([...e.target.files]);
@@ -905,7 +906,7 @@ function viewer(files, idx, refresh) {
       ${info && info.frames > 1 ? `<label class="f small">Frame<input type="range" id="frm" min="1" max="${info.frames}" value="${V.frame + 1}"></label>` : ""}
       ${im && !(API.reportImage && API.reportImage(f)) ? `<p class="small muted">${matchMedia("(pointer:coarse)").matches ? "Pinch to zoom, double-tap to zoom in. Pick <b>W/L</b> and drag: sideways for window, up/down for level." : "Drag with <b>W/L</b>: sideways = window, up/down = level. Ctrl+scroll or pinch zooms, scroll steps through slices, double-click zooms. Keys: ← → files, ↑ ↓ slices, + − 0, I, W, P, F."}</p>` : ""}
       <dl>${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
-      <div class="row"><a class="btn sm" href="${esc(API.fileUrl(f.id, 1))}" download="${esc(f.filename)}">${I.dl} Original</a><button class="btn sm danger" id="del">Delete</button></div>
+      <div class="row">${f.study_id && f.kind !== "report" ? `<button class="btn sm" id="cmpb" title="Show next to another study of this patient">Compare</button>` : ""}<a class="btn sm" href="${esc(API.fileUrl(f.id, 1))}" download="${esc(f.filename)}">${I.dl} Original</a><button class="btn sm danger" id="del">Delete</button></div>
       <p class="small muted">Stored encrypted (AES-256-GCM). Decrypted only while you view it.</p>`;
     $("#prev", m.el).onclick = () => { idx--; load(true); };
     $("#next", m.el).onclick = () => { idx++; load(true); };
@@ -913,6 +914,7 @@ function viewer(files, idx, refresh) {
     if (wi) { const upd = () => { const w = parseFloat(wi.value), c = parseFloat(li.value); if (!isNaN(w) && !isNaN(c)) setWL(c, w, true); }; wi.onchange = upd; li.onchange = upd; }
     const slc = $("#slc", m.el); if (slc) slc.oninput = () => { const n = ser[slc.value - 1]; if (n && n !== f) { idx = files.indexOf(n); load(true); } };
     const frm = $("#frm", m.el); if (frm) frm.oninput = () => { V.frame = frm.value - 1; apply(); clearTimeout(settleT); settleT = setTimeout(() => rerender(true), 120); };
+    const cb = $("#cmpb", m.el); if (cb) cb.onclick = () => { m.close(); pickCompare(f.study_id, f).catch(handleErr); };
     $("#del", m.el).onclick = async () => { if (await confirmBox("Delete file?", `Delete ${esc(f.filename)} from this server?`)) { await API.req("DELETE", `/api/files/${f.id}`); m.close(); toast("Deleted"); refresh(); } };
   }
 
@@ -972,6 +974,251 @@ function viewer(files, idx, refresh) {
   };
   document.addEventListener("keydown", key);
   load(false);
+}
+
+// ------------------------------------------------------------------ compare two studies side by side
+const imageFiles = files => files.filter(f => f.kind === "dicom" || f.kind === "image");
+const wordsOf = t => new Set(String(t || "").toLowerCase().match(/[a-z0-9]+/g) || []);
+function seriesGroups(files) {
+  const out = [], by = {};
+  for (const f of imageFiles(files)) {
+    const k = seriesKey(f) || "photos";
+    if (!by[k]) out.push(by[k] = { key: k, label: k === "photos" ? "Photos and scans" : (f.dicom?.series_description || "Series"), files: [] });
+    by[k].files.push(f);
+  }
+  out.forEach((g, i) => { if (out.filter(x => x.label === g.label).length > 1) g.label += ` (${i + 1})`; });
+  return out;
+}
+function bestSeries(groups, label) {
+  // The series whose description shares the most words with the other side's, else the first.
+  const w = wordsOf(label); let best = 0, top = -1;
+  groups.forEach((g, i) => { const v = wordsOf(g.label), n = [...w].filter(x => v.has(x)).length / (new Set([...w, ...v]).size || 1); if (n > top) { top = n; best = i; } });
+  return best;
+}
+function gapText(s) {
+  if (s.days_apart == null || !s.relation) return "";
+  if (s.relation === "same day") return "Same day";
+  const d = s.days_apart, t = d < 45 ? `${d} day${d === 1 ? "" : "s"}` : d < 548 ? `${Math.round(d / 30.4)} months` : `${(d / 365.25).toFixed(1).replace(/\.0$/, "")} years`;
+  return `${t} ${s.relation === "prior" ? "earlier" : "later"}`;
+}
+
+async function pickCompare(sid, fromFile) {
+  const [base, rows] = await Promise.all([API.req("GET", `/api/studies/${sid}`), API.req("GET", `/api/studies/${sid}/similar`)]);
+  const usable = rows.filter(r => r.image_count > 0), sug = usable.filter(r => r.suggested), rest = usable.filter(r => !r.suggested);
+  const item = r => `<button class="card cmpick" data-s="${esc(r.id)}">
+    <div class="film">${(r.thumbnail_ids || []).slice(0, 2).map(id => `<div class="t"><img alt="" loading="lazy" src="${esc(API.thumbUrl(id))}"></div>`).join("") || `<div class="t">${I.scan}</div>`}</div>
+    <div><b>${esc(r.title)}</b><div class="small muted">${[r.study_date ? fmtDate(r.study_date) : "No date", gapText(r), `${r.image_count} image${r.image_count === 1 ? "" : "s"}`].filter(Boolean).map(esc).join(" · ")}</div>
+    ${r.match_reasons.length ? `<div class="row" style="gap:4px;margin-top:6px">${r.match_reasons.map(x => `<span class="badge ${x === "Other side" ? "warn" : ""}">${esc(x)}</span>`).join("")}</div>` : ""}</div>${I.chev}</button>`;
+  const m = modal("Compare side by side", `<p class="small muted" style="margin:0 0 12px">Pick a study to show next to <b>${esc(base.title)}</b>${base.study_date ? ` (${esc(fmtDate(base.study_date))})` : ""}. Zoom, pan, window/level and slice scrolling stay linked.</p>
+    ${!usable.length ? `<div class="empty" style="padding:24px 8px">${I.scan}<p>${esc(rows.length ? "This patient's other studies have no images to compare." : "This patient has no other studies yet. Upload a prior study to compare.")}</p></div>` : ""}
+    ${sug.length ? `<div class="section-h" style="margin-top:0"><h2>Suggested matches</h2></div><div class="stack cmlist">${sug.map(item).join("")}</div>` : ""}
+    ${rest.length ? `<div class="section-h"><h2>${sug.length ? "Other studies" : "Studies for this patient"}</h2></div><div class="stack cmlist">${rest.map(item).join("")}</div>` : ""}`);
+  $$("[data-s]", m.el).forEach(b => b.onclick = () => { m.close(); compareView(base, usable.find(r => r.id === b.dataset.s), fromFile).catch(handleErr); });
+}
+
+let cmpSeq = 0;
+async function compareView(sa, sb, fromFile) {
+  const [fa, fb] = await Promise.all([sa, sb].map(s => API.req("GET", `/api/studies/${s.id}/files`)));
+  // Earlier study on the left, like films hung prior then current.
+  let pair = [[sa, fa], [sb, fb]];
+  if ((sb.study_date || "") < (sa.study_date || "") || (!sb.study_date && sa.study_date)) pair.reverse();
+  const coarse = matchMedia("(pointer:coarse)").matches;
+  const V = { tool: coarse ? "pan" : "wl", sync: true, off: 0, active: 0 };
+  const P = pair.map(([s, files], n) => ({ n, s, groups: seriesGroups(files), g: 0, i: 0, f: null, im: null, info: null, base: null,
+    c: null, w: null, frame: 0, zoom: 1, px: 0, py: 0, inv: false, seq: 0, lastUrl: null, t: null, fid: `svcmp${++cmpSeq}` }));
+  const fromPane = fromFile ? P.findIndex(p => p.s.id === fromFile.study_id) : -1;
+  if (fromPane >= 0) { const p = P[fromPane]; p.g = Math.max(0, p.groups.findIndex(g => g.files.some(f => f.id === fromFile.id))); p.i = p.groups[p.g].files.findIndex(f => f.id === fromFile.id); V.active = fromPane; }
+  const lead = P[fromPane >= 0 ? fromPane : 1], other = P[lead.n ? 0 : 1];
+  other.g = bestSeries(other.groups, lead.groups[lead.g]?.label);
+
+  const pane = p => `<section class="cpane" data-p="${p.n}">
+    <div class="cphead"><div class="cpt"><b>${esc(p.s.title)}</b><span>${[p.s.study_date ? fmtDate(p.s.study_date) : "No date", p.s.modality].filter(Boolean).map(esc).join(" · ")}</span></div>
+      ${p.groups.length > 1 ? `<select data-ser aria-label="Series">${p.groups.map((g, i) => `<option value="${i}" ${i === p.g ? "selected" : ""}>${esc(g.label)} (${g.files.length})</option>`).join("")}</select>` : ""}</div>
+    <div class="stage" tabindex="0" aria-label="${esc(p.s.title)}. Drag to pan or adjust window, scroll for slices."><div class="hud"></div>
+      <svg width="0" height="0" style="position:absolute" aria-hidden="true"><filter id="${p.fid}" color-interpolation-filters="sRGB"><feComponentTransfer><feFuncR type="linear" slope="1" intercept="0"/><feFuncG type="linear" slope="1" intercept="0"/><feFuncB type="linear" slope="1" intercept="0"/></feComponentTransfer></filter></svg></div>
+    <div class="cpslice"><input type="range" data-slc min="1" max="1" value="1" aria-label="Slice"></div></section>`;
+  const m = modal("Compare studies", `<div class="cmp">
+    <div class="vtools cmpbar">
+      <div class="vseg" role="group" aria-label="Drag tool"><button data-tool="pan" title="Drag to pan (P)">Pan</button><button data-tool="wl" title="Drag to adjust window/level (W)">W/L</button></div>
+      <button data-act="sync" title="Link zoom, pan, window/level and slices (L)">Linked</button>
+      <button data-act="inv" title="Invert (I)">Invert</button>
+      <button data-act="zout" aria-label="Zoom out">−</button><button data-act="zin" aria-label="Zoom in">+</button>
+      <button data-act="reset" title="Reset view (0)">Reset</button>
+      <button data-act="swap" title="Swap sides">Swap</button>
+      ${document.fullscreenEnabled ? `<button data-act="fs" title="Full screen (F)">Full screen</button>` : ""}
+    </div><div class="cmpgrid">${P.map(pane).join("")}</div></div>`, { wide: true });
+  const modalEl = $(".modal", m.el); modalEl.classList.add("cmpmodal");
+  $(".modal .body", m.el).style.padding = "0";
+  P.forEach(p => { p.el = $(`[data-p="${p.n}"]`, m.el); p.stage = $(".stage", p.el); });
+
+  const gray = p => p.info && !p.info.rgb;
+  const files = p => p.groups[p.g]?.files || [];
+  const count = p => files(p).length > 1 ? files(p).length : (p.info?.frames || 1);
+  const pos = p => files(p).length > 1 ? p.i : p.frame;
+  const frac = p => count(p) > 1 ? pos(p) / (count(p) - 1) : 0;
+  const fmtN = n => Math.abs(n) >= 100 ? Math.round(n) : Math.round(n * 10) / 10;
+  const def = p => p.info && p.info.server ? [p.info.dc, p.info.dw] : [128, 256];
+  const others = p => V.sync ? P.filter(q => q !== p) : [];
+
+  function filterFor(p) {
+    let s = 1, i = 0;
+    if (gray(p) && p.base && p.c != null) { const { c: c0, w: w0 } = p.base, w1 = Math.max(1, p.w); s = w0 / w1; i = (c0 - p.c) / w1 + 0.5 - w0 / (2 * w1); }
+    if (p.inv) { s = -s; i = 1 - i; }
+    ["R", "G", "B"].forEach(ch => { const fn = $(`#${p.fid} feFunc${ch}`, m.el); fn.setAttribute("slope", s.toFixed(5)); fn.setAttribute("intercept", i.toFixed(5)); });
+  }
+  function apply(p) {
+    if (p.im) { p.im.style.transform = `translate(${p.px}px,${p.py}px) scale(${p.zoom})`; p.im.style.filter = `url(#${p.fid})`; }
+    filterFor(p);
+    const u = p.info && p.info.server && p.info.modality === "CT" ? " HU" : "";
+    $(".hud", p.el).innerHTML = [gray(p) && p.c != null ? `<span>W ${fmtN(p.w)} · L ${fmtN(p.c)}${u}</span>` : "",
+      count(p) > 1 ? `<span>${files(p).length > 1 ? "Image" : "Frame"} ${pos(p) + 1} / ${count(p)}</span>` : "", `<span>${Math.round(p.zoom * 100)}%</span>`].filter(Boolean).join("");
+    const r = $("[data-slc]", p.el); r.max = count(p); if (document.activeElement !== r) r.value = pos(p) + 1; r.parentElement.hidden = count(p) < 2;
+    p.el.classList.toggle("on", V.active === p.n);
+  }
+  function applyBar() {
+    $$("[data-tool]", m.el).forEach(b => b.classList.toggle("on", b.dataset.tool === V.tool));
+    $("[data-act=sync]", m.el).classList.toggle("on", V.sync); $("[data-act=sync]", m.el).setAttribute("aria-pressed", V.sync);
+    $("[data-act=inv]", m.el).classList.toggle("on", P[V.active].inv);
+  }
+  async function rerender(p, force) {
+    if (!p.info || !p.info.server || !gray(p)) return;
+    if (!force && p.base && p.base.c === p.c && p.base.w === p.w && p.base.frame === p.frame) return;
+    const seq = ++p.seq, fid = p.f.id;
+    try {
+      const r = await API.render(fid, { wc: p.c, ww: p.w, frame: p.frame });
+      if (seq !== p.seq || fid !== p.f.id) return;
+      await new Promise(res => { const t = new Image(); t.onload = res; t.onerror = res; t.src = r.url; });
+      if (seq !== p.seq || !p.im) return;
+      p.im.src = r.url; if (p.lastUrl && p.lastUrl !== r.url && p.lastUrl.startsWith("blob:")) URL.revokeObjectURL(p.lastUrl); p.lastUrl = r.url;
+      p.base = { c: r.wc, w: r.ww, frame: p.frame }; apply(p);
+    } catch { /* keep the in-browser approximation */ }
+  }
+  const settle = (p, ms = 220) => { clearTimeout(p.t); p.t = setTimeout(() => rerender(p), ms); };
+
+  async function load(p, keepWL) {
+    const f = files(p)[p.i]; p.f = f;
+    const keep = keepWL && p.c != null;
+    p.base = null; p.info = null; p.im = null; p.frame = 0;
+    p.stage.querySelectorAll("img,.empty").forEach(e => e.remove());
+    let src = null;
+    if (!f) { p.stage.insertAdjacentHTML("afterbegin", `<div class="empty" style="color:#9fb3b6">${I.scan}<p>No images in this study.</p></div>`); apply(p); return; }
+    if (f.kind === "dicom") {
+      try {
+        const r = await API.render(f.id, { wc: keep ? p.c : null, ww: keep ? p.w : null });
+        if (p.f !== f) return;
+        p.info = { server: true, rgb: r.rgb, frames: r.frames, modality: r.modality, min: r.min, max: r.max, dc: r.dc, dw: r.dw };
+        p.frame = r.frame; src = r.url; p.lastUrl = r.url;
+        if (!r.rgb) { p.base = { c: r.wc, w: r.ww, frame: r.frame }; if (!keep) { p.c = r.wc; p.w = r.ww; } }
+      } catch { if (f.has_thumbnail) { src = (API.previewUrl || API.thumbUrl)(f.id); p.info = { server: false, rgb: false, frames: 1, min: 0, max: 255 }; } }
+    } else { src = API.fileUrl(f.id); p.info = { server: false, rgb: false, frames: 1, min: 0, max: 255 }; }
+    if (p.f !== f) return;
+    if (p.info && !p.info.server) { p.base = { c: 128, w: 256 }; if (!keep) { p.c = 128; p.w = 256; } }
+    if (src) { p.stage.insertAdjacentHTML("afterbegin", `<img alt="${esc(f.filename)}" src="${esc(src)}" draggable="false">`); p.im = $("img", p.stage); }
+    else p.stage.insertAdjacentHTML("afterbegin", `<div class="empty" style="color:#9fb3b6">${I.file}<p>No preview for this file.</p></div>`);
+    apply(p);
+  }
+
+  // ---- linked changes: the pane the person touched leads, the other follows when linked
+  function setView(p, z, x, y) { for (const q of [p, ...others(p)]) { q.zoom = z; q.px = x; q.py = y; apply(q); } }
+  function setWL(p, c, w, now) {
+    p.c = c; p.w = Math.max(1, w); apply(p); now ? rerender(p) : settle(p);
+    for (const q of others(p)) {
+      if (!gray(q) || q.c == null) continue;
+      if (p.info?.modality === "CT" && q.info?.modality === "CT" && p.info.server && q.info.server) { q.c = p.c; q.w = p.w; }
+      else { const [dc, dw] = def(p), [qc, qw] = def(q); q.w = Math.max(1, qw * p.w / dw); q.c = qc + (p.c - dc) * qw / dw; }
+      apply(q); now ? rerender(q) : settle(q);
+    }
+  }
+  function goTo(p, n) {
+    n = Math.max(0, Math.min(count(p) - 1, n));
+    if (n === pos(p)) return false;
+    if (files(p).length > 1) { p.i = n; load(p, true); } else { p.frame = n; apply(p); settle(p, 120); }
+    return true;
+  }
+  function move(p, n) {
+    if (!goTo(p, n)) return;
+    for (const q of others(p)) { const sign = q.n > p.n ? 1 : -1, t = Math.max(0, Math.min(1, frac(p) + sign * V.off)); goTo(q, Math.round(t * (count(q) - 1))); }
+  }
+  const step = (p, d) => move(p, pos(p) + d);
+  const link = () => { V.off = frac(P[1]) - frac(P[0]); const a = P[V.active]; setView(a, a.zoom, a.px, a.py); };
+  function zoomAt(p, k, cx, cy) {
+    const r = p.stage.getBoundingClientRect();
+    const x = (cx ?? r.left + r.width / 2) - (r.left + r.width / 2), y = (cy ?? r.top + r.height / 2) - (r.top + r.height / 2);
+    const nz = Math.max(.25, Math.min(16, p.zoom * k)), q = nz / p.zoom;
+    setView(p, nz, x - (x - p.px) * q, y - (y - p.py) * q);
+  }
+  function act(a) {
+    const p = P[V.active];
+    if (a === "sync") { V.sync = !V.sync; if (V.sync) link(); toast(V.sync ? "Linked: both sides move together" : "Unlinked: each side moves on its own"); }
+    if (a === "inv") { p.inv = !p.inv; apply(p); for (const q of others(p)) { q.inv = p.inv; apply(q); } }
+    if (a === "zin") zoomAt(p, 1.4);
+    if (a === "zout") zoomAt(p, 1 / 1.4);
+    if (a === "reset") { for (const q of V.sync ? P : [p]) { q.zoom = 1; q.px = q.py = 0; q.inv = false; if (q.info && gray(q)) { const [c, w] = def(q); q.c = c; q.w = Math.max(1, w); rerender(q, true); } apply(q); } }
+    if (a === "swap") { const [x, y] = [P[0], P[1]]; const grid = $(".cmpgrid", m.el); grid.insertBefore(y.el, x.el); P.reverse(); P.forEach((q, i) => { q.n = i; q.el.dataset.p = i; }); V.off = -V.off; V.active = V.active ? 0 : 1; P.forEach(apply); }
+    if (a === "fs") { (document.fullscreenElement ? document.exitFullscreen() : modalEl.requestFullscreen()).catch(() => toast("Full screen isn't allowed here")); }
+    applyBar();
+  }
+  $$("[data-tool]", m.el).forEach(b => b.onclick = () => { V.tool = b.dataset.tool; applyBar(); });
+  $$("[data-act]", m.el).forEach(b => b.onclick = () => act(b.dataset.act));
+
+  for (const p of P) {
+    const sel = $("[data-ser]", p.el);
+    if (sel) sel.onchange = async () => { p.g = +sel.value; p.i = 0; await load(p, false); if (V.sync) link(); };
+    const r = $("[data-slc]", p.el);
+    r.oninput = () => { V.active = p.n; move(p, r.value - 1); P.forEach(apply); };
+    const pts = new Map(); let drag = null, pinch = null, lastTap = 0;
+    p.stage.addEventListener("pointerdown", e => {
+      if (V.active !== p.n) { V.active = p.n; P.forEach(apply); applyBar(); }
+      p.stage.focus({ preventScroll: true });
+      if (!p.im) return;
+      p.stage.setPointerCapture(e.pointerId); pts.set(e.pointerId, [e.clientX, e.clientY]);
+      if (pts.size === 2) { const [a, b] = [...pts.values()]; pinch = { d: Math.hypot(a[0] - b[0], a[1] - b[1]), z: p.zoom, mx: (a[0] + b[0]) / 2, my: (a[1] + b[1]) / 2, px: p.px, py: p.py }; drag = null; return; }
+      const now = Date.now();
+      if (now - lastTap < 300) { p.zoom > 1.05 ? setView(p, 1, 0, 0) : zoomAt(p, 2.5, e.clientX, e.clientY); lastTap = 0; return; }
+      lastTap = now;
+      drag = { x: e.clientX, y: e.clientY, px: p.px, py: p.py, c: p.c, w: p.w, tool: e.button === 2 || e.shiftKey ? "wl" : e.button === 1 ? "pan" : V.tool };
+    });
+    p.stage.addEventListener("pointermove", e => {
+      if (!pts.has(e.pointerId)) return;
+      pts.set(e.pointerId, [e.clientX, e.clientY]);
+      if (pinch && pts.size >= 2) { const [a, b] = [...pts.values()], d = Math.hypot(a[0] - b[0], a[1] - b[1]); setView(p, Math.max(.25, Math.min(16, pinch.z * d / pinch.d)), pinch.px + (a[0] + b[0]) / 2 - pinch.mx, pinch.py + (a[1] + b[1]) / 2 - pinch.my); return; }
+      if (!drag) return;
+      const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+      if (drag.tool === "wl" && gray(p) && drag.w != null) { const sens = Math.max(.5, ((p.info.max - p.info.min) || 256) / 700); setWL(p, drag.c - dy * sens, drag.w + dx * sens); }
+      else setView(p, p.zoom, drag.px + dx, drag.py + dy);
+    });
+    const up = e => { pts.delete(e.pointerId); if (pts.size < 2) pinch = null; if (!pts.size) drag = null; };
+    p.stage.addEventListener("pointerup", up); p.stage.addEventListener("pointercancel", up);
+    p.stage.addEventListener("contextmenu", e => { if (p.im) e.preventDefault(); });
+    p.stage.addEventListener("wheel", e => {
+      if (!p.im) return; e.preventDefault(); V.active = p.n;
+      if (e.ctrlKey || e.metaKey || count(p) < 2) zoomAt(p, Math.exp(-Math.max(-60, Math.min(60, e.deltaY)) * (e.ctrlKey ? .01 : .004)), e.clientX, e.clientY);
+      else { p.acc = (p.acc || 0) + e.deltaY; if (Math.abs(p.acc) >= 40) { step(p, Math.sign(p.acc)); p.acc = 0; } }
+    }, { passive: false });
+  }
+  const key = e => {
+    if (!document.body.contains(m.el)) return document.removeEventListener("keydown", key);
+    if (e.target.matches("input,select,textarea")) return;
+    const k = e.key, p = P[V.active];
+    if (k === "ArrowDown") { e.preventDefault(); step(p, 1); }
+    else if (k === "ArrowUp") { e.preventDefault(); step(p, -1); }
+    else if (k === "ArrowLeft" || k === "ArrowRight") { V.active = k === "ArrowLeft" ? 0 : 1; P.forEach(apply); applyBar(); }
+    else if (k === "+" || k === "=") zoomAt(p, 1.25);
+    else if (k === "-") zoomAt(p, 1 / 1.25);
+    else if (k === "0") act("reset");
+    else if (k === "i" || k === "I") act("inv");
+    else if (k === "l" || k === "L") act("sync");
+    else if (k === "w" || k === "W") { V.tool = "wl"; applyBar(); }
+    else if (k === "p" || k === "P") { V.tool = "pan"; applyBar(); }
+    else if (k === "f" || k === "F") act("fs");
+  };
+  document.addEventListener("keydown", key);
+  applyBar();
+  P[V.active].stage.focus({ preventScroll: true }); // keys drive the images, not the first slider
+  await Promise.all(P.map(p => load(p, false)));
+  // Start the follower at the same relative position as the slice the person came from.
+  if (fromPane >= 0 && count(lead) > 1) goTo(other, Math.round(frac(lead) * (count(other) - 1)));
+  V.off = frac(P[1]) - frac(P[0]);
 }
 
 // ------------------------------------------------------------------ upload page (mobile-first)

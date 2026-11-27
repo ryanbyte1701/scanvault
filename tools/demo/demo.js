@@ -91,7 +91,7 @@ function S(p, title, mod, date, facility, nImg, report, extra = {}) {
   db.studies.push(s);
   if (report) db.files.push({ id: id(), study_id: s.id, patient_id: p.id, filename: report.name, content_type: "application/pdf", size_bytes: 180000 + seq * 931, kind: "report", has_thumbnail: false, uploaded_at: iso(ag - 0.01), _report: report });
   const imod = mod === "CR" ? "DX" : mod;
-  for (let i = 0; i < nImg; i++) db.files.push({ id: id(), study_id: s.id, patient_id: p.id, filename: `IM${String(i + 1).padStart(6, "0")}.dcm`, content_type: "application/dicom", size_bytes: imod === "DX" || imod === "MG" ? 9800000 + i * 1000 : 530000 + i * 777, kind: "dicom", has_thumbnail: true, uploaded_at: iso(ag - 0.01), _img: [imod, i],
+  for (let i = 0; i < nImg; i++) db.files.push({ id: id(), study_id: s.id, patient_id: p.id, filename: `IM${String(i + 1).padStart(6, "0")}.dcm`, content_type: "application/dicom", size_bytes: imod === "DX" || imod === "MG" ? 9800000 + i * 1000 : 530000 + i * 777, kind: "dicom", has_thumbnail: true, uploaded_at: iso(ag - 0.01), _img: [imod, i + (extra.shift || 0)],
     dicom: { modality: mod, study_date: date, series_description: extra.series || title.toUpperCase(), institution: facility, instance_number: String(i + 1), rows: imod === "DX" ? "2500" : "512", columns: imod === "DX" ? "2048" : "512", frames: "1", body_part: extra.body, patient_name: p.name.toUpperCase() } });
   return s;
 }
@@ -105,6 +105,8 @@ S(sam, "Ultrasound abdomen", "US", "2025-05-11", "Children's Hospital", 5, null,
 const mom = P("Margaret Doe", "1952-11-30", "F", "MRN 0039915", "Pacemaker (MRI conditional). Cardiologist: Dr. Huang.");
 S(mom, "Screening mammogram", "MG", "2026-08-21", "Women's Imaging Associates", 4, { name: "mammo-BIRADS-report.pdf", lines: [["Exam", "Bilateral screening mammogram with tomosynthesis."], ["Findings", "Scattered fibroglandular tissue. No suspicious mass, calcifications or architectural distortion."], ["Impression", "BI-RADS 1: Negative. Routine annual screening."]] }, { body: "BREAST", series: "R CC / L CC / R MLO / L MLO" });
 S(mom, "CT head without contrast", "CT", "2025-12-03", "Northside Hospital ED", 6, { name: "CT-head-report.pdf", lines: [["Indication", "Fall at home, on anticoagulation."], ["Findings", "No acute intracranial hemorrhage, mass effect or midline shift. Age-appropriate volume loss."], ["Impression", "No acute intracranial abnormality."]] }, { body: "HEAD", series: "AXIAL 5MM" });
+S(jane, "MRI left knee", "MR", "2024-06-10", "Lakeside Imaging Center", 8, { name: "MRI-knee-2024-report.pdf", lines: [["Indication", "Left knee pain, no injury."], ["Findings", "Mild degenerative signal in the posterior horn of the medial meniscus without a tear. Small joint effusion."], ["Impression", "Early medial meniscal degeneration. No tear."]] }, { body: "KNEE", series: "SAG PD FS", shift: 1 });
+S(mom, "CT head", "CT", "2023-04-18", "Northside Hospital", 6, null, { body: "HEAD", series: "AXIAL 5MM", shift: 1 });
 db.files.filter(f => f._img && f._img[0] === "CT" && db.studies.find(s => s.id === f.study_id).title.includes("head")).forEach(f => f._img[0] = "HEAD");
 db.targets.push(
   { id: id(), type: "gdrive", name: "Google Drive", enabled: true, schedule_hours: 24, keep_last: 14, config: { auth_mode: "oauth", client_id: "1234-abc.apps.googleusercontent.com", folder_id: "1AbCdEfScanVault" }, secrets_set: { client_secret: true, refresh_token: true, service_account_json: false }, connected: true, last_run: iso(0.3), last_status: "ok" },
@@ -121,6 +123,32 @@ function recoveryText() {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"; const a = new Uint8Array(58); crypto.getRandomValues(a);
   const k = [...a].map(x => chars[x % 32]).join("").replace(/(.{4})/g, "$1 ").trim();
   return `SCANVAULT EMERGENCY RECOVERY KEY\n================================\n\nVault ID:         ${state.vault_id}\nKey fingerprint:  ${state.fp}\nCreated:          ${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC\n\nThis file can decrypt EVERY ScanVault backup of this vault, including\nbackups stored on Google Drive, Box or SFTP servers. Anyone who holds it\ncan read the medical records inside. Print it or store it offline.\n\n-----BEGIN SCANVAULT RECOVERY KEY-----\n${k.slice(0, 39)}\n${k.slice(40)}\n-----END SCANVAULT RECOVERY KEY-----\n\nTo restore: choose 'Restore from backup' in a fresh ScanVault, or run\n  python3 tools/restore.py --key scanvault-recovery-key.txt --backup <file>.svb --out ./restored\n`;
+}
+
+// ---------------------------------------------------------- similar studies (mirrors app/similar.py)
+const MODG = { CR: "XR", DX: "XR", DR: "XR", XR: "XR", MR: "MR", MRI: "MR", PT: "PET", PET: "PET" }, MODN = { XR: "X-ray", MR: "MRI", CT: "CT", US: "ultrasound", MG: "mammogram", NM: "nuclear medicine", PET: "PET" };
+const STOP = new Set("a an and the of with without w wo o contrast iv non noncon study exam imaging image images series scan routine protocol view views screening followup follow up limited complete bilateral single mr ct xr us dx cr mg nm pet pt".split(" "));
+const ALIAS = { mri: "mr", xray: "xr", x: "xr", ray: "xr", radiograph: "xr", lt: "left", rt: "right", l: "left", r: "right", knees: "knee", hips: "hip", wrists: "wrist", shoulders: "shoulder", ankles: "ankle", brain: "head", skull: "head", thorax: "chest", lungs: "chest", lung: "chest", abd: "abdomen", abdominal: "abdomen", mammo: "breast", mammogram: "breast", mammography: "breast" };
+const modOf = s => { const m = (s.modality || "").trim().toUpperCase(); return MODG[m] || m; };
+const wordsOf = s => new Set(([s.title, s.description, s.body_part].join(" ").toLowerCase().match(/[a-z]+/g) || []).map(w => ALIAS[w] || w).filter(w => !STOP.has(w) && w.length > 1));
+function likeness(a, b) {
+  let pts = 0; const why = [], ma = modOf(a), mb = modOf(b), ba = (a.body_part || "").trim().toLowerCase(), bb = (b.body_part || "").trim().toLowerCase();
+  if (ma && ma === mb) { pts += 2; why.push(`Same type (${MODN[ma] || ma})`); }
+  if (ba && ba === bb) { pts += 2; why.push(`Same body part (${ba})`); }
+  const wa = wordsOf(a), wb = wordsOf(b), side = w => w === "left" || w === "right";
+  const pa = [...wa].filter(w => !side(w)), pb = [...wb].filter(w => !side(w)), all = new Set([...pa, ...pb]), common = pa.filter(w => pb.includes(w));
+  if (common.length) { pts += 3 * common.length / all.size; if (!(ba && ba === bb)) why.push("Similar description"); }
+  const sa = [...wa].filter(side).sort().join(), sb = [...wb].filter(side).sort().join();
+  if (pts && sa && sb && sa !== sb) { pts -= 1.5; why.push("Other side"); }
+  return [Math.round(Math.max(pts, 0) * 100) / 100, why];
+}
+function similarTo(base) {
+  const day = s => s.study_date ? Date.parse(s.study_date + "T12:00:00") : null, d0 = day(base);
+  return db.studies.filter(s => s.patient_id === base.patient_id && s.id !== base.id).map(s => {
+    const [pts, why] = likeness(base, s), d1 = day(s), fl = db.files.filter(f => f.study_id === s.id);
+    return { ...studyOut(s), similarity: pts, suggested: pts >= 3 && !why.includes("Other side"), match_reasons: why, days_apart: d0 && d1 ? Math.round(Math.abs(d1 - d0) / 86400000) : null,
+      relation: !(d0 && d1) ? null : d1 < d0 ? "prior" : d1 > d0 ? "later" : "same day", thumbnail_ids: fl.filter(f => f.has_thumbnail).slice(0, 3).map(f => f.id), image_count: fl.filter(f => f.kind !== "report").length };
+  }).sort((x, y) => (x.suggested === y.suggested ? 0 : x.suggested ? -1 : 1) || y.similarity - x.similarity || (x.days_apart ?? 1e6) - (y.days_apart ?? 1e6));
 }
 
 // ---------------------------------------------------------- router
@@ -198,6 +226,7 @@ async function req(method, path, body) {
     if (method === "DELETE") { db.studies = db.studies.filter(x => x !== s); db.files = db.files.filter(f => f.study_id !== s.id); return { ok: true }; }
     return studyOut(s);
   }
+  if ((m = url.match(/^\/api\/studies\/([^/]+)\/similar$/))) return similarTo(findS(m[1]));
   if ((m = url.match(/^\/api\/studies\/([^/]+)\/files$/))) {
     findS(m[1]);
     const order = f => ({ report: 0, dicom: 2 }[f.kind] ?? 1);

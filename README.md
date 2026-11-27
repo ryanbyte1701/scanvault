@@ -20,6 +20,11 @@ a USB disk.
   scroll or slider through a series, a frame slider for multi-frame files,
   fullscreen and keyboard shortcuts. Photos get the same tools in the browser.
   PDFs open inline.
+- **Compare side by side**: put two studies of the same patient next to each
+  other (prior on the left, current on the right). Suggested matches come first:
+  same type of scan and body part, closest in time. Zoom, pan, window/level,
+  invert and slice scrolling stay linked; unlink to line up anatomy, then relink
+  and both sides keep that offset. Stacks top and bottom on a phone.
 - **Themes**: light, dark or match device, with a choice of dark color (six
   presets or any custom color). Saved per account, so it follows you across
   devices.
@@ -54,14 +59,18 @@ All screenshots use the default dark theme and the built-in sample vault
 <td><img src="docs/screenshots/backups.png" alt="Backup destinations with schedule, retention and history"><br><sub><b>Backups.</b> Per-destination schedule, retention and run history.</sub></td>
 <td><img src="docs/screenshots/settings.png" alt="Settings with theme, dark color presets and encryption details"><br><sub><b>Settings.</b> Theme, dark color presets and key fingerprint.</sub></td>
 </tr>
+<tr>
+<td colspan="2"><img src="docs/screenshots/compare.png" alt="Prior and current knee MRI side by side with linked window/level and slices"><br><sub><b>Compare.</b> Prior and current study side by side, zoom, window/level and slices linked.</sub></td>
+</tr>
 </table>
 
 <p>
-<img src="docs/screenshots/mobile-home.png" width="19%" alt="Phone: home dashboard">
-<img src="docs/screenshots/mobile-patient.png" width="19%" alt="Phone: patient record">
-<img src="docs/screenshots/mobile-study.png" width="19%" alt="Phone: study">
-<img src="docs/screenshots/mobile-viewer.png" width="19%" alt="Phone: DICOM viewer">
-<img src="docs/screenshots/mobile-backups.png" width="19%" alt="Phone: backups">
+<img src="docs/screenshots/mobile-home.png" width="16%" alt="Phone: home dashboard">
+<img src="docs/screenshots/mobile-patient.png" width="16%" alt="Phone: patient record">
+<img src="docs/screenshots/mobile-study.png" width="16%" alt="Phone: study">
+<img src="docs/screenshots/mobile-viewer.png" width="16%" alt="Phone: DICOM viewer">
+<img src="docs/screenshots/mobile-compare.png" width="16%" alt="Phone: two studies compared, stacked">
+<img src="docs/screenshots/mobile-backups.png" width="16%" alt="Phone: backups">
 </p>
 
 ## Quick start

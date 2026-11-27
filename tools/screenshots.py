@@ -33,6 +33,13 @@ async def open_vault(ctx, demo):
     return pg
 
 
+async def later(pg):
+    # the demo vault asks to save the recovery key first
+    if await pg.get_by_text("Remind me later").count():
+        await pg.get_by_text("Remind me later").click()
+        await pg.wait_for_timeout(800)
+
+
 async def nav(pg, label):
     await pg.locator("[data-go]:visible", has_text=label).first.click()
     await pg.wait_for_timeout(900)
@@ -49,9 +56,26 @@ async def shot(pg, name):
     await pg.screenshot(path=str(path))
     # 256-colour palette keeps the PNGs small; dither only the scan images
     im = Image.open(path).convert("RGB")
-    dither = Image.Dither.FLOYDSTEINBERG if "viewer" in name or name == "study" else Image.Dither.NONE
+    dither = Image.Dither.FLOYDSTEINBERG if "viewer" in name or "compare" in name or name == "study" else Image.Dither.NONE
     im.quantize(colors=256, method=Image.Quantize.MEDIANCUT, dither=dither).save(path, optimize=True)
     print("wrote", path.relative_to(ROOT))
+
+
+async def compare(pg, name):
+    """Prior and current knee MRI side by side, linked, a few slices in."""
+    await nav(pg, "Patients")
+    await click(pg, "a.pcard", "Jane Doe")
+    await click(pg, "a.study", "MRI left knee")
+    await pg.click("#cmp")
+    await pg.wait_for_timeout(600)
+    await pg.locator(".cmpick").first.click()
+    await pg.wait_for_timeout(1500)
+    for _ in range(3):
+        await pg.keyboard.press("ArrowDown")
+        await pg.wait_for_timeout(300)
+    await shot(pg, name)
+    await pg.keyboard.press("Escape")
+    await pg.wait_for_timeout(400)
 
 
 async def capture(demo):
@@ -86,6 +110,7 @@ async def capture(demo):
         pg = await open_vault(ctx, demo)
         await pg.click("#skip")
         await pg.wait_for_timeout(1200)
+        await later(pg)
         await shot(pg, "home")
         await nav(pg, "Patients")
         await shot(pg, "patients")
@@ -103,6 +128,7 @@ async def capture(demo):
         await shot(pg, "viewer")
         await pg.keyboard.press("Escape")
         await pg.wait_for_timeout(400)
+        await compare(pg, "compare")
         await nav(pg, "Backups")
         await shot(pg, "backups")
         await nav(pg, "Upload")
@@ -116,6 +142,7 @@ async def capture(demo):
         pg = await open_vault(ctx, demo)
         await pg.click("#skip")
         await pg.wait_for_timeout(1200)
+        await later(pg)
         await shot(pg, "mobile-home")
         await nav(pg, "Patients")
         await click(pg, "a.pcard", "Jane Doe")
@@ -129,6 +156,7 @@ async def capture(demo):
         await shot(pg, "mobile-viewer")
         await pg.keyboard.press("Escape")
         await pg.wait_for_timeout(400)
+        await compare(pg, "mobile-compare")
         await nav(pg, "Backups")
         await shot(pg, "mobile-backups")
         await ctx.close()
