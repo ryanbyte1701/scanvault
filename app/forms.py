@@ -16,7 +16,7 @@ from starlette.requests import Request
 from .spool import Spool, SpoolFull
 
 MAX_FIELD = 64 * 1024
-MAX_PARTS = 2000
+MAX_PARTS = 500  # each file part is an open scratch file; the web UI sends big folders in batches of 200
 
 
 class FormError(Exception):

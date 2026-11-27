@@ -51,10 +51,16 @@ def test_s3_provider_endpoints():
         ("wasabi", "eu-central-1", {}, "https://s3.eu-central-1.wasabisys.com"),
         ("r2", "", {"account_id": "abc123"}, "https://abc123.r2.cloudflarestorage.com"),
         ("c2", "us-001", {}, "https://us-001.s3.synologyc2.net"),
-        ("minio", "", {"endpoint_url": "http://nas.local:9000"}, "http://nas.local:9000"),
+        ("minio", "", {"endpoint_url": "https://nas.local:9000"}, "https://nas.local:9000"),
     ]:
         cl = targets.make("s3", {"provider": prov, "region": region, "bucket": "b", "access_key_id": "a", "secret_access_key": "s", **extra})._client()
         assert cl.meta.endpoint_url == expect, prov
+    # an http endpoint saved before https was required is refused when used
+    with pytest.raises(targets.TargetError, match="https"):
+        targets.make("s3", {"provider": "minio", "endpoint_url": "http://nas.local:9000", "bucket": "b", "access_key_id": "a", "secret_access_key": "s"})._client()
+    # a region can't smuggle in another host
+    with pytest.raises(targets.TargetError):
+        targets.make("s3", {"provider": "b2", "region": "x.evil.example/", "bucket": "b", "access_key_id": "a", "secret_access_key": "s"})._client()
 
 
 # ------------------------------------------------------------------ Dropbox

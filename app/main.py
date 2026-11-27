@@ -17,7 +17,7 @@ import time
 import zipfile
 import zlib
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -71,11 +71,41 @@ store = Store()
 vault = crypto.Vault()
 backup_lock = threading.Lock()
 _state = {"maintenance": None, "last_activity": time.time(), "setup_code": None, "rekeying": False}
-# Requests that may change stored data (POST, PUT, PATCH, DELETE) currently
-# being handled. A master key change waits for these to finish and refuses new
-# ones, so nothing is written with the old key while files are re-encrypted.
-_inflight = {"n": 0}
 _MUTATING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+class KeyGate:
+    """Signed-in work that writes with the master key (uploads, edits, deletes,
+    restores, saving backup tokens, building an archive). A master key change
+    closes the gate, waits for the work already inside to finish, then runs.
+    Only requests that have passed sign-in get in, so a stranger holding a
+    connection open can't delay a key change; reads and sign-in never wait."""
+
+    def __init__(self):
+        self.n = 0
+        self.closed = False
+        self._lock = threading.Lock()
+
+    def enter(self) -> None:
+        with self._lock:
+            if self.closed:
+                raise ApiError(503, "Changing the master key. Try again in a moment.", "maintenance", {"Retry-After": "30"})
+            self.n += 1
+
+    def exit(self) -> None:
+        with self._lock:
+            self.n -= 1
+
+    @contextmanager
+    def held(self):
+        self.enter()
+        try:
+            yield
+        finally:
+            self.exit()
+
+
+key_gate = KeyGate()
 _setup_lock = asyncio.Lock()
 
 
@@ -128,17 +158,11 @@ APP_CSP = (
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    if request.method in _MUTATING:
-        if _state["rekeying"]:
-            resp = JSONResponse({"error": _state["maintenance"] or "Changing the master key", "code": "maintenance"}, status_code=503, headers={"Retry-After": "30"})
-        else:
-            _inflight["n"] += 1
-            try:
-                resp = await call_next(request)
-            finally:
-                _inflight["n"] -= 1
-    else:
+    try:
         resp = await call_next(request)
+    finally:
+        if request.scope.pop("sv_gated", False):
+            key_gate.exit()
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
     resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
@@ -225,6 +249,7 @@ class Throttle:
 
 login_throttle = Throttle(free=5)
 account_throttle = Throttle(free=10)
+device_throttle = Throttle(free=10)
 key_throttle = Throttle(free=5)
 setup_throttle = Throttle(free=5)
 
@@ -285,7 +310,17 @@ def require_user(request: Request) -> dict:
 
 def data_access(request: Request) -> bytes:
     require_user(request)
-    return mk()
+    m = mk()
+    if request.method in _MUTATING:
+        gate_request(request)
+    return m
+
+
+def gate_request(request: Request) -> None:
+    """Hold the key gate until this (signed-in) request has been answered."""
+    if not request.scope.get("sv_gated"):
+        key_gate.enter()
+        request.scope["sv_gated"] = True
 
 
 def new_session(user_id: str, identity_id: str | None = None) -> tuple[str, float]:
@@ -468,7 +503,26 @@ def passphrase_bits(p: str) -> float:
     char_bits = eff * math.log2(pool) if pool else 0.0
     if re.fullmatch(r"[0-9]+", p):
         char_bits = min(char_bits, len(set(p)) * 3.3)
+    # People build "random" strings from a word, a year and a symbol
+    # (Summer2024!!). Count each run of letters as one guessable word, a year
+    # as a handful of choices, and repeats as nothing.
+    char_bits = min(char_bits, _pattern_bits(p))
     return max(word_bits, char_bits)
+
+
+def _pattern_bits(p: str) -> float:
+    bits = 0.0
+    for run in re.findall(r"[A-Z][a-z]+|[a-z]+|[A-Z]+|[0-9]+|[^A-Za-z0-9]+", p):
+        if run[0].isalpha():
+            if len(run) >= 4:
+                bits += 11.0 + (1.0 if run[0].isupper() else 0.0)
+            else:
+                bits += len(run) * math.log2(52)
+        elif run[0].isdigit():
+            bits += 7.0 if re.fullmatch(r"(19|20)\d\d", run) else len(set(run)) * 3.3 + max(0, len(run) - len(set(run)))
+        else:
+            bits += 5.0 * len(set(run)) + 1.0 * (len(run) - len(set(run)))
+    return bits
 
 
 def _new_setup_code() -> str:
@@ -528,6 +582,7 @@ async def setup(request: Request):
         c = store.conn()
         uid = crypto.random_id()
         c.execute("DELETE FROM sessions")
+        c.execute("DELETE FROM user_devices")
         c.execute("DELETE FROM user_identities")
         c.execute("DELETE FROM users")
         c.execute("INSERT INTO users(id,username,password_hash,role,created_at) VALUES(?,?,?,?,?)", (uid, username, pw_hash, "admin", time.time()))
@@ -582,6 +637,7 @@ async def setup_restore(request: Request):
             pw_hash = await asyncio.to_thread(crypto.hash_password, password)
             c = store.conn()
             c.execute("DELETE FROM sessions")
+            c.execute("DELETE FROM user_devices")
             c.execute("DELETE FROM user_identities")  # SSO links belonged to the replaced login
             c.execute("DELETE FROM users")
             _sso_save({**_sso_cfg(), "local_login": True})
@@ -614,44 +670,53 @@ async def login(request: Request):
     r = store.conn().execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
     # The per-account limit stops guessing spread over many addresses, but must
     # not let a stranger lock the owner out: a browser or app that has signed
-    # in successfully before carries a device token and skips it.
-    device = request.cookies.get("sv_device") or jstr(j, "device")
-    known = bool(r) and _device_ok(r, device)
-    if not known:
-        account_throttle.attempt("user:" + username.lower())
+    # in before carries its own random device token, and is limited per device
+    # instead (so a stolen token still only buys a few guesses).
+    dev_id = _device_lookup(r, request.cookies.get("sv_device") or jstr(j, "device")) if r else None
+    akey = ("dev:" + dev_id) if dev_id else ("user:" + username.lower())
+    (device_throttle if dev_id else account_throttle).attempt(akey)
     ok = await asyncio.to_thread(crypto.verify_password, password, r["password_hash"] if r else crypto.DUMMY_PASSWORD_HASH)
     if not r or not ok:
         raise ApiError(401, "Wrong username or password")
     login_throttle.success(*keys)
-    if not known:
-        account_throttle.reset("user:" + username.lower())
+    (device_throttle if dev_id else account_throttle).reset(akey)
     tok, exp = new_session(r["id"])
-    dev = _device_token(r)
+    dev = None if dev_id else _new_device(r["id"])
     body = {"expires_at": iso(exp), "unlocked": vault.unlocked}
-    if not _is_browser(request):
+    if dev and not _is_browser(request):
         body["device"] = dev
     resp = session_response(request, body, tok, exp)
-    resp.set_cookie("sv_device", dev, max_age=365 * 86400, httponly=True, samesite="strict", secure=_secure(request), path="/api/auth/login")
+    if dev:
+        resp.set_cookie("sv_device", dev, max_age=365 * 86400, httponly=True, samesite="strict", secure=_secure(request), path="/api/auth/login")
     return resp
 
 
-def _device_secret() -> bytes:
-    sec = store.get_config("device_secret")
-    if not sec:
-        sec = secrets.token_hex(32)
-        store.set_config("device_secret", sec)
-    return bytes.fromhex(sec)
+MAX_DEVICES = 50
 
 
-def _device_token(user) -> str:
-    """Proof that this browser or app signed in to this account before. It is
-    tied to the password hash, so changing the password retires every token."""
-    mac = hmac.new(_device_secret(), f"device:{user['id']}:{user['password_hash']}".encode(), hashlib.sha256).hexdigest()
-    return f"d1.{mac}"
+def _new_device(user_id: str) -> str:
+    """A random token proving this browser or app signed in to this account
+    before. Stored hashed; a password change retires all of them."""
+    did, secret = crypto.random_id(), secrets.token_urlsafe(24)
+    c = store.conn()
+    now = time.time()
+    c.execute("INSERT INTO user_devices(id,user_id,token_hash,created_at,last_used) VALUES(?,?,?,?,?)", (did, user_id, _th(secret), now, now))
+    c.execute(
+        "DELETE FROM user_devices WHERE user_id=? AND id NOT IN (SELECT id FROM user_devices WHERE user_id=? ORDER BY last_used DESC LIMIT ?)",
+        (user_id, user_id, MAX_DEVICES),
+    )
+    return f"d2.{did}.{secret}"
 
 
-def _device_ok(user, token: str | None) -> bool:
-    return bool(token) and hmac.compare_digest(str(token), _device_token(user))
+def _device_lookup(user, token: str | None) -> str | None:
+    parts = str(token or "").split(".")
+    if len(parts) != 3 or parts[0] != "d2":
+        return None
+    row = store.conn().execute("SELECT id, token_hash FROM user_devices WHERE id=? AND user_id=?", (parts[1], user["id"])).fetchone()
+    if not row or not hmac.compare_digest(row["token_hash"], _th(parts[2])):
+        return None
+    store.conn().execute("UPDATE user_devices SET last_used=? WHERE id=?", (time.time(), row["id"]))
+    return row["id"]
 
 
 @app.post("/api/auth/logout")
@@ -694,6 +759,7 @@ async def change_password(request: Request):
     c = store.conn()
     c.execute("UPDATE users SET password_hash=? WHERE id=?", (h, u["id"]))
     n = c.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?", (u["id"], u["token_hash"])).rowcount
+    c.execute("DELETE FROM user_devices WHERE user_id=?", (u["id"],))
     return {"ok": True, "signed_out": n}
 
 
@@ -777,6 +843,7 @@ def lock(request: Request):
 async def get_recovery_key(request: Request):
     """Re-download the recovery key file. Requires the encryption passphrase."""
     require_user(request)
+    gate_request(request)
     j = await body_json(request, 64 * 1024)
     master = await _verify_passphrase(request, jstr(j, "passphrase"))
     return PlainTextResponse(recovery_text(master), headers={"Content-Disposition": 'attachment; filename="scanvault-recovery-key.txt"'})
@@ -803,6 +870,7 @@ async def change_passphrase(request: Request):
     valid and the recovery key file does not change. (To make old backups and
     the old recovery key useless, use /api/vault/rekey.)"""
     u = require_user(request)
+    gate_request(request)  # not while the master key is being replaced
     j = await body_json(request, 64 * 1024)
     master = await _verify_passphrase(request, jstr(j, "current"), "Current encryption key is wrong")
     new = jstr(j, "new")
@@ -849,24 +917,44 @@ async def rekey(request: Request):
             raise ApiError(400, "Use a different value for the encryption key and the sign-in password")
     if _state["maintenance"] or not backup_lock.acquire(blocking=False):
         raise ApiError(409, "A backup or another key change is running. Try again when it has finished.")
-    _state["maintenance"] = "Changing the master key. This can take a while for large vaults."
-    _state["rekeying"] = True
+    failed_after_commit = False
     try:
-        # Let uploads, restores and deletes that are already running finish
-        # first (this request is the one in-flight change that remains).
+        with key_gate._lock:
+            key_gate.closed = True
+        _state["rekeying"] = True
+        # Let signed-in uploads, restores and deletes that are already running
+        # finish first. Reads and sign-in keep working meanwhile.
         deadline = time.monotonic() + REKEY_WAIT
-        while _inflight["n"] > 1:
+        while key_gate.n > 0:
             if time.monotonic() > deadline:
                 raise ApiError(409, "Uploads or other changes are still running. Try again when they have finished.", "busy")
             await asyncio.sleep(0.05)
-        new_master = await asyncio.to_thread(_rekey, master, new_pass)
+        _state["maintenance"] = "Changing the master key. This can take a while for large vaults."
+        try:
+            new_master = await asyncio.to_thread(_rekey, master, new_pass)
+        except RekeyCommitted:
+            failed_after_commit = True
+            raise ApiError(500, "The master key change could not be finished. Restart ScanVault to complete it, then unlock with the new encryption key.", "rekey_incomplete")
     finally:
+        if failed_after_commit:
+            # The database already uses the new key but the files could not be
+            # swapped in. Stay locked until a restart finishes the change.
+            vault.lock()
+            _clear_caches()
+            _state["maintenance"] = "A master key change could not be finished. Restart ScanVault to complete it."
+        else:
+            _state["maintenance"] = None
+            with key_gate._lock:
+                key_gate.closed = False
         _state["rekeying"] = False
-        _state["maintenance"] = None
         backup_lock.release()
     vault.master_key = new_master
     _clear_caches()
     return {"ok": True, "fingerprint": store.keystore()["fingerprint"], "recovery_key": recovery_text(new_master)}
+
+
+class RekeyCommitted(Exception):
+    """A key change was committed to the database but not finished on disk."""
 
 
 def _rekey_paths(jid: str) -> tuple[Path, Path, Path]:
@@ -928,7 +1016,11 @@ def _rekey(old: bytes, passphrase: str) -> bytes:
             new_ks_path.unlink(missing_ok=True)
             journal.unlink(missing_ok=True)
             raise
-        _finish_rekey(jid)
+        try:
+            _finish_rekey(jid)
+        except Exception as exc:
+            log.error("Master key change committed but could not be finished: %s", exc)
+            raise RekeyCommitted(str(exc)) from exc
     log.info("Master key rotated; new fingerprint %s", crypto.fingerprint(new))
     return new
 
@@ -2009,16 +2101,12 @@ async def download_backup(request: Request):
     name = backup.backup_name(store.keystore()["vault_id"])
     path = _tmp_name(name)
     started = time.time()
-    if _state["rekeying"]:
-        raise ApiError(503, _state["maintenance"] or "Changing the master key", "maintenance")
-    _inflight["n"] += 1  # a key change waits for this archive to be written
     try:
-        await asyncio.to_thread(backup.create_archive, store, master, path, VERSION, bool(store.get_config("backup_include_wrapped_key", False)))
+        with key_gate.held():  # a key change waits for this archive to be written
+            await asyncio.to_thread(backup.create_archive, store, master, path, VERSION, bool(store.get_config("backup_include_wrapped_key", False)))
     except Exception:
         path.unlink(missing_ok=True)
         raise
-    finally:
-        _inflight["n"] -= 1
     size = path.stat().st_size
 
     def done():
@@ -2034,6 +2122,7 @@ async def download_backup(request: Request):
 @app.get("/api/backups/targets/{tid}/remote")
 async def list_remote(tid: str, request: Request):
     master = data_access(request)
+    gate_request(request)  # listing may save refreshed tokens
     tgt = _make_target(_target_row(tid), master)
     items = await asyncio.to_thread(tgt.list_backups)
     return [{"name": n, "handle": h} for n, h in reversed(items)]
@@ -2117,7 +2206,11 @@ def oauth_callback(provider: str, request: Request, state: str = "", code: str =
         return RedirectResponse("/#/backups?oauth=error&msg=denied")
     if not entry or time.time() - entry[1] > OAUTH_STATE_TTL:
         return RedirectResponse("/#/backups?oauth=error&msg=expired")
-    if not vault.unlocked:
+    if not vault.unlocked or _state["maintenance"]:
+        return RedirectResponse("/#/backups?oauth=error&msg=locked")
+    try:
+        gate_request(request)  # the tokens are saved sealed with the master key
+    except ApiError:
         return RedirectResponse("/#/backups?oauth=error&msg=locked")
     master = vault.master_key
     tid = entry[0]
@@ -2339,9 +2432,11 @@ async def sso_link_start(pid: str, request: Request):
     Body: ``{password}`` (not needed within 10 minutes of an SSO sign-in)."""
     u = require_user(request)
     try:
-        j = await request.json()
-    except Exception:
-        j = {}
+        j = await body_json(request, 64 * 1024)
+    except ApiError as exc:
+        if exc.status == 413:
+            raise
+        j = {}  # an empty body is fine right after an SSO sign-in
     await _reauth(u, j if isinstance(j, dict) else {})
     p = _sso_provider(pid)
     url, binding = _sso_flow(request, p, "link", user_id=u["id"])

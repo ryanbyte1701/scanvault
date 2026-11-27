@@ -141,10 +141,10 @@ many idle minutes. Sessions last at most 30 days and end after
 `SCANVAULT_SESSION_IDLE_DAYS` (default 14) without use. Changing the sign-in
 password signs out every other device; Settings also has *Sign out other
 devices*. Sign-in, unlock and key checks are rate limited (5 free failures,
-then growing delays, per client and per account). The per-account limit is
-skipped by a browser or app that has signed in to that account before (it
-holds a device token that changes with the password), so failed guesses from
-strangers can't lock you out of your own vault.
+then growing delays, per client and per account). A browser or app that has
+signed in to that account before holds its own random device token and is
+limited per device instead, so failed guesses from strangers can't lock you
+out of your own vault. Changing the password retires every device token.
 
 New encryption keys are checked for strength: four or more random words, or
 a long mix of letters, digits and symbols. Common passwords and repeated
@@ -329,8 +329,10 @@ Authenticate with `POST /api/auth/login {username, password}` → `{token, expir
 failed sign-ins or key checks return **429** with `Retry-After`. A successful
 password sign-in also returns `device`: send it back as `device` in later
 `/api/auth/login` bodies so the per-account lockout never applies to this
-app. Mutating requests return **503** `{code: "maintenance"}` while the master
-key is being changed.
+app (each device gets its own token). Changes return **503**
+`{code: "maintenance"}` while the master key is being changed; sign-in and
+reads keep working until the re-encryption itself starts. One upload request
+takes at most 500 files.
 A locked vault returns **423** `{code: "locked"}`; unlock with
 `POST /api/vault/unlock {passphrase}`.
 

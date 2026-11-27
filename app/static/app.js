@@ -701,8 +701,17 @@ function wireDrop(el, cb) {
 async function uploadFiles(path, files, done) {
   const q = $("#queue");
   let ok = 0, skipped = 0;
-  // Patient imports go up as one batch so reports land in the same study as the DICOM beside them.
-  const batches = path.includes("/import") && files.length > 1 ? [files] : files.map(f => [f]);
+  // Patient imports go up together so reports land in the same study as the
+  // DICOM beside them. Big folder exports are split into batches (the server
+  // holds every file of a request open); reports and photos go in the first.
+  const BATCH = 200;
+  let batches = files.map(f => [f]);
+  if (path.includes("/import") && files.length > 1) {
+    const loose = f => /\.(pdf|jpe?g|png|gif|heic|tiff?|txt|docx?|zip)$/i.test(f.name);
+    const sorted = [...files.filter(loose), ...files.filter(f => !loose(f))];
+    batches = [];
+    for (let i = 0; i < sorted.length; i += BATCH) batches.push(sorted.slice(i, i + BATCH));
+  }
   for (const batch of batches) {
     const row = document.createElement("div");
     row.className = "qitem";

@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import re
 import posixpath
 import shutil
 import time
@@ -714,12 +715,15 @@ class S3(Target):
 
     type = "s3"
     secret_fields = ("secret_access_key",)
-    location_fields = ("provider", "endpoint_url", "account_id")
+    location_fields = ("provider", "endpoint_url", "account_id", "region")
 
     @classmethod
     def validate(cls, config: dict) -> None:
         from urllib.parse import urlparse
 
+        region = (config.get("region") or "").strip()
+        if region and not re.fullmatch(r"[a-z0-9-]{1,40}", region):
+            raise TargetError("Region may only contain lowercase letters, digits and dashes (e.g. eu-central-1)")
         ep = (config.get("endpoint_url") or "").strip()
         if ep:
             u = urlparse(ep)
@@ -737,7 +741,11 @@ class S3(Target):
         endpoint = (c.get("endpoint_url") or "").strip()
         region = (c.get("region") or "").strip() or ("auto" if prov == "r2" else "us-east-1")
         if not endpoint and S3_PRESETS.get(prov):
+            if not re.fullmatch(r"[a-z0-9-]{1,40}", region) or not re.fullmatch(r"[A-Za-z0-9-]{0,64}", c.get("account_id") or ""):
+                raise TargetError("Region and account ID may only contain letters, digits and dashes")
             endpoint = S3_PRESETS[prov].format(region=region, account_id=c.get("account_id", ""))
+        if endpoint:
+            self.validate({"endpoint_url": endpoint})  # also for destinations saved before https was required
         if not c.get("bucket"):
             raise TargetError("Bucket name is required")
         if not c.get("access_key_id") or not c.get("secret_access_key"):

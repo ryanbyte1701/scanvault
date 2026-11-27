@@ -23,8 +23,9 @@ PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
 
 
 def _reset_throttles():
-    for t in (main.login_throttle, main.account_throttle, main.key_throttle, main.setup_throttle):
+    for t in (main.login_throttle, main.account_throttle, main.device_throttle, main.key_throttle, main.setup_throttle):
         t._fails.clear()
+    main.key_gate.closed, main.key_gate.n = False, 0
 
 
 @pytest.fixture()
@@ -479,7 +480,7 @@ def test_rekey(vault, tmp_path):
     f = c.post(f"/api/studies/{s['id']}/files", files=[("file", ("r.pdf", PDF))], headers=B).json()[0]
     t = c.post("/api/backups/targets", json={"type": "sftp", "name": "nas", "config": {"host": "h", "username": "u", "password": "pw"}}, headers=B).json()
     old_mk = main.vault.master_key
-    r = c.post("/api/vault/rekey", json={"passphrase": PASS, "new_passphrase": "rotated-passphrase-9"}, headers=B)
+    r = c.post("/api/vault/rekey", json={"passphrase": PASS, "new_passphrase": "rotated-quartz-passphrase-9"}, headers=B)
     assert r.status_code == 200, r.text
     new_rec = r.json()["recovery_key"]
     assert main.vault.master_key != old_mk
@@ -491,7 +492,7 @@ def test_rekey(vault, tmp_path):
     assert c.post("/api/vault/unlock", json={"recovery_key": j["recovery_key"]}, headers=B).status_code == 400
     assert c.post("/api/vault/unlock", json={"passphrase": PASS}, headers=B).status_code == 400
     assert c.post("/api/vault/unlock", json={"recovery_key": new_rec}, headers=B).status_code == 200
-    assert c.post("/api/vault/recovery-key", json={"passphrase": "rotated-passphrase-9"}, headers=B).status_code == 200
+    assert c.post("/api/vault/recovery-key", json={"passphrase": "rotated-quartz-passphrase-9"}, headers=B).status_code == 200
     assert not list(main.store.dir.glob("rekey*"))
 
 
@@ -530,22 +531,56 @@ def test_passphrase_file_edge_cases(vault, tmp_path, monkeypatch, caplog):
 def test_rekey_waits_for_running_changes(vault, monkeypatch):
     c, B, j = vault
     _patient(c, B, "Busy")
-    # another upload is still running: the key change gives up instead of racing it
+    # a signed-in upload is still running: the key change gives up instead of racing it
     monkeypatch.setattr(main, "REKEY_WAIT", 0.3)
-    main._inflight["n"] += 1
+    main.key_gate.enter()
     try:
-        r = c.post("/api/vault/rekey", json={"passphrase": PASS, "new_passphrase": "rotated-passphrase-9"}, headers=B)
+        r = c.post("/api/vault/rekey", json={"passphrase": PASS, "new_passphrase": "rotated-quartz-passphrase-9"}, headers=B)
         assert r.status_code == 409 and r.json()["code"] == "busy"
     finally:
-        main._inflight["n"] -= 1
-    assert main._state["maintenance"] is None and not main._state["rekeying"]
-    # while a key change runs, new changes are refused
-    main._state["rekeying"] = True
+        main.key_gate.exit()
+    assert main._state["maintenance"] is None and not main.key_gate.closed and main.key_gate.n == 0
+    # while a key change waits, new changes are refused but reads and sign-in work
+    main.key_gate.closed = True
     try:
         assert c.post("/api/patients", json={"name": "x"}, headers=B).status_code == 503
+        assert c.get("/api/patients", headers=B).status_code == 200
+        c.cookies.clear()
+        assert c.post("/api/auth/login", json={"username": "ryan", "password": PW}).status_code == 200
     finally:
-        main._state["rekeying"] = False
-    assert c.post("/api/vault/rekey", json={"passphrase": PASS, "new_passphrase": "rotated-passphrase-9"}, headers=B).status_code == 200
+        main.key_gate.closed = False
+    assert main.key_gate.n == 0
+    assert c.post("/api/vault/rekey", json={"passphrase": PASS, "new_passphrase": "rotated-quartz-passphrase-9"}, headers=B).status_code == 200
+
+
+def test_strangers_do_not_hold_the_key_gate(vault):
+    c, B, j = vault
+    # requests that never get past sign-in don't count
+    for path in ("/api/patients", "/api/backups/restore", "/api/auth/login"):
+        c.cookies.clear()
+        c.post(path, content=b"{}", headers={"Content-Type": "application/json"})
+    assert main.key_gate.n == 0
+    # nor do signed-in reads
+    c.get("/api/patients", headers=B)
+    assert main.key_gate.n == 0
+
+
+def test_rekey_failing_after_commit_locks_the_vault(vault, monkeypatch):
+    c, B, j = vault
+    p = _patient(c, B, "Committed")
+    real = main._finish_rekey
+    monkeypatch.setattr(main, "_finish_rekey", lambda jid: (_ for _ in ()).throw(OSError("disk full")))
+    r = c.post("/api/vault/rekey", json={"passphrase": PASS, "new_passphrase": "rotated-quartz-passphrase-9"}, headers=B)
+    assert r.status_code == 500 and r.json()["code"] == "rekey_incomplete"
+    assert not main.vault.unlocked and main._state["maintenance"]
+    assert c.post("/api/patients", json={"name": "x"}, headers=B).status_code == 503
+    # a restart finishes the change; the new key then opens everything
+    monkeypatch.setattr(main, "_finish_rekey", real)
+    main._recover_rekey()
+    main._state["maintenance"] = None
+    main.key_gate.closed = False
+    assert c.post("/api/vault/unlock", json={"passphrase": "rotated-quartz-passphrase-9"}, headers=B).status_code == 200
+    assert c.get("/api/patients", headers=B).json()[0]["name"] == "Committed"
 
 
 def test_big_zip_import_needs_few_open_files(vault, tmp_path):
@@ -631,3 +666,50 @@ def test_status_hides_version_until_signed_in(vault):
     assert c.get("/api/status").json()["version"] is None
     assert c.get("/api/status", headers=B).json()["version"] == main.VERSION
     assert "version" not in c.get("/api/health").json()
+
+
+# ------------------------------------------------------------------ second verification
+
+def test_device_tokens_are_per_device_and_retired_by_password_change(vault):
+    c, B, j = vault
+    c.cookies.clear()
+    d1 = c.post("/api/auth/login", json={"username": "ryan", "password": PW}).json()["device"]
+    c.cookies.clear()
+    d2 = c.post("/api/auth/login", json={"username": "ryan", "password": PW}).json()["device"]
+    assert d1 != d2 and d1.startswith("d2.")
+    # a known device gets its own small limit, not a free pass
+    codes = []
+    for _ in range(12):
+        main.login_throttle._fails.clear()
+        c.cookies.clear()
+        codes.append(c.post("/api/auth/login", json={"username": "ryan", "password": "wrong-password", "device": d1}).status_code)
+    assert codes[:10] == [401] * 10 and codes[-1] == 429
+    # ...which doesn't touch the other device
+    c.cookies.clear()
+    main.login_throttle._fails.clear()
+    assert c.post("/api/auth/login", json={"username": "ryan", "password": PW, "device": d2}).status_code == 200
+    # changing the password retires every device token
+    r = c.post("/api/auth/password", json={"current": PW, "new": "pw-another-0987"}, headers=B)
+    assert r.status_code == 200, r.text
+    assert main.store.conn().execute("SELECT COUNT(*) FROM user_devices").fetchone()[0] == 0
+
+
+def test_s3_region_change_needs_the_secret_again(vault):
+    cfg = main._merge_config("s3", {"provider": "b2", "region": "us-west-004", "bucket": "b", "access_key_id": "a", "secret_access_key": "s"}, {"region": "eu-central-003"})
+    assert "secret_access_key" not in cfg
+    with pytest.raises(main.ApiError):
+        main._merge_config("s3", {}, {"provider": "b2", "region": "evil.example.com/x", "bucket": "b"})
+
+
+def test_pattern_passphrases_refused():
+    for weak in ("Summer2024!!", "Password2025#", "CorrectHorse1!"):
+        with pytest.raises(main.ApiError):
+            main._validate_new_passphrase(weak)
+    for ok in ("CorrectHorseBatteryStaple", "x7#Kq9!mZ2pL", "orbit-cedar-lantern-quill"):
+        main._validate_new_passphrase(ok)
+
+
+def test_sso_link_body_is_capped(vault):
+    c, B, j = vault
+    r = c.post("/api/auth/sso/nope/link", content=b'{"password":"' + b"x" * 200000 + b'"}', headers={**B, "Content-Type": "application/json"})
+    assert r.status_code == 413

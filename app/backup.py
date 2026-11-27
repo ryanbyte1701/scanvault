@@ -63,6 +63,7 @@ def _db_snapshot(store) -> tuple[bytes, list[str]]:
     try:
         src.backup(mem)
         mem.execute("DELETE FROM sessions")  # never ship session tokens off the box
+        mem.execute("DELETE FROM user_devices")
         mem.commit()
         ids = [r[0] for r in mem.execute("SELECT id FROM files")]
         data = bytearray(mem.serialize())
@@ -226,6 +227,7 @@ def restore_into_store(store, archive: Path, master_key: bytes, keep_local: bool
                 store.migrate()
                 c = store.conn()
                 c.execute("DELETE FROM sessions")
+                c.execute("DELETE FROM user_devices")
                 c.execute("UPDATE backup_targets SET enabled=0")
                 c.execute("UPDATE backup_runs SET status='error', message='Interrupted' WHERE status='running'")
             for sub, target in (("files", store.files_dir), ("previews", store.preview_dir)):

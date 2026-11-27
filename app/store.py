@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at REAL NOT NULL, expires_at REAL NOT NULL,
   last_seen REAL);
+CREATE TABLE IF NOT EXISTS user_devices (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, token_hash TEXT NOT NULL, created_at REAL NOT NULL, last_used REAL);
 CREATE TABLE IF NOT EXISTS patients (
   id TEXT PRIMARY KEY, created_at REAL NOT NULL, updated_at REAL NOT NULL, blob BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS studies (
